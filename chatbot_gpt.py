@@ -316,8 +316,8 @@ def check_auto_reset():
 # ══════════════════════════════════════════════════════
 def main():
     st.set_page_config(
-        page_title="生活小幫手",
-        page_icon="🌿",
+        page_title="演慈聊天機器人",
+        page_icon="🤖",
         layout="centered",
     )
 
@@ -455,7 +455,7 @@ def main():
     <div id="fixed-header">
       <div class="inner">
         <div>
-          <h1>🌿 生活小幫手</h1>
+          <h1>🤖 演慈聊天機器人</h1>
           <p class="sub">日常生活問答 · GPT-4o-mini</p>
         </div>
         <div class="right">
