@@ -2,7 +2,10 @@ import streamlit as st
 import json
 import time
 import re
+import os
+import requests
 import traceback
+import pandas as pd
 from openai import OpenAI
 from streamlit_autorefresh import st_autorefresh
 
@@ -13,6 +16,15 @@ RESET_SECONDS  = 300
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 OPENAI_MODEL   = "gpt-4o-mini"
 AUTOREFRESH_MS = 1000
+
+# ── CWA 天氣 API 設定 ──────────────────────────────────
+CWA_API_KEY      = st.secrets.get("CWA_API_KEY", "")   # 至 opendata.cwa.gov.tw 免費申請
+CWA_DEFAULT_CITY = "臺北市"                              # 預設查詢城市，可依需求修改
+
+# ── MD 資料庫設定 ──────────────────────────────────────
+MD_DATABASE_PATH = "database"
+EXCEL_PATH       = "總題目單.xlsx"
+MD_CONTENT_MAX_CHARS = 4000
 
 # ══════════════════════════════════════════════════════
 #  System Prompt
@@ -58,14 +70,57 @@ text 和 links 至少一個有內容，links 只在確實有網址時填寫。
 將 PLACE 替換為使用者提到的繁體中文地名。
 
 ==========================================================
-【第三優先：題庫問答】
+【第三優先：天氣問題回答（依據注入的即時天氣資料）】
+==========================================================
+當 system prompt 末尾出現【今日天氣資料】區塊時，請以該資料為唯一依據回答天氣相關問題。
+回答時務必帶入資料中的數值，語氣親切，並在 links 填入 CWA 連結。
+
+各類天氣問題回答規則：
+
+今天天氣怎麼樣 / 今天溫度如何
+→ 說明天氣現象、氣溫範圍（最低～最高）、舒適度
+
+今天會下雨嗎 / 今天需要帶雨傘嗎
+→ 降雨機率 ≥ 60%：建議一定要帶傘 ☔
+   降雨機率 30–59%：帶把傘備用比較保險
+   降雨機率 < 30%：今天應該不太需要帶傘 ☀️
+
+今天太陽會不會很大 / 今天適合出門嗎
+→ 根據天氣現象（晴／多雲／陰／雨）與舒適度判斷，給出建議
+
+今天的天氣適合洗衣服嗎
+→ 晴天＋低降雨機率＋舒適：適合；陰雨或高濕度：不太適合
+
+天氣會不會突然變化
+→ 若天氣現象含「局部陣雨」或「午後雷陣雨」等字眼，提醒可能短暫變天
+
+今天風會不會很大 / 今天會不會很潮濕 / 今天會不會起霧
+→ 根據舒適度與天氣現象描述回答，無明確資料則保守說明
+
+會不會有颱風
+→ 若天氣現象不含颱風字眼，回答目前無颱風警報，點連結確認最新資訊
+
+若 system prompt 末尾沒有【今日天氣資料】（API 失敗）：
+→ 回傳 {"text":"你可以點下方連結查看最新天氣預報！☁️","links":["https://www.cwa.gov.tw/V8/C/W/County/index.html"]}
+
+==========================================================
+【第四優先：MD 資料庫內容回答】
+==========================================================
+當使用者訊息末尾附有 [MD資料庫內容] 區塊時：
+1. 以該內容為主要依據，用繁體中文親切地整理並回答
+2. 重點條列景點、地點、時間等關鍵資訊，不要直接複製大量原文
+3. 若 MD 內容有景點清單，列出景點名稱與簡短說明（2-3 個字）即可
+4. links 欄位：若 MD 開頭有 URL Source，請填入該網址；若有多個 MD 檔各有 URL，全部填入
+5. 回覆長度適中，以條列為主，方便閱讀
+6. 仍維持 JSON 格式
+
+範例格式：
+{"text":"小巨蛋附近有很多好玩的地方！🎪\n\n🏛️ 臺北市藝文推廣處（城市舞台）— 421公尺\n🌿 遼寧公園 — 798公尺\n🛍️ 遼寧街夜市 — 806公尺\n🏛️ 東區商圈 — 1.12公里\n⋯\n點下方連結看更多周邊景點！","links":["https://www.travel.taipei/zh-tw/attraction/nearby-attractions/271?page=1"]}
+
+==========================================================
+【第五優先：題庫問答】
 ==========================================================
 根據以下題庫找語意最接近的問題並回傳答案。
-
---- 天氣類 ---
-今天天氣怎麼樣/今天溫度如何/今天會下雨嗎/今天太陽會不會很大/會不會有颱風/今天適合出門嗎/今天需要帶雨傘嗎/天氣會不會突然變化/今天的天氣適合洗衣服嗎/今天風會不會很大/今天會不會很潮濕/今天會不會起霧
-→ {"text":"你可以點下方連結查看最新天氣預報！","links":["https://www.cwa.gov.tw/V8/C/W/County/index.html"]}
-為什麼天空是藍色的 → {"text":"因為太陽進入大氣層時，波長較短的藍光比波長較長的紅光更容易被空氣中的微小分子散射，散射的藍光充滿了整個天空，所以我們看到天空是藍色的 🌈","links":[]}
 
 --- 衣著類 ---
 天氣冷該穿什麼 → {"text":"多穿厚的外套跟包腳的鞋子，如果可以衣服有棉在內襯比較保暖喔！","links":[]}
@@ -94,16 +149,14 @@ text 和 links 至少一個有內容，links 只在確實有網址時填寫。
 捷運怎麼搭/要搭什麼車/路線怎麼走 → {"text":"你可以用 Google Maps 查詢最佳路線！🗺️","links":["https://www.google.com/maps?authuser=0"]}
 
 --- 娛樂類 ---
-台北推薦甚麼景點/台北有什麼好玩的 → {"text":"以下有台北景點推薦，點進去看看吧！🏙️","links":["https://www.klook.com/zh-TW/blog/taipei-destination-taiwan/?aid=api%7C67008%7C691fd6d0a233360001887676%7Cpid%7C886667&aff_pid=886667&aff_sid=&aff_adid=948770&utm_medium=affiliate-alwayson&utm_source=non-network&utm_campaign=67008&utm_term=886667&utm_content=&aff_klick_id=114951889007-api%7C67008%7C691fd6d0a233360001887676%7Cpid%7C886667-948770-86eb656&gad_source=1","https://bobbyfun.tw/2024-03-06-3082/"]}
-台北車站附近有什麼好玩的景點 → {"text":"台北車站周邊有很多景點！🚉","links":["https://www.google.com/maps/search/臺北車站景點"]}
-台北小巨蛋附近有什麼好玩的 → {"text":"台北小巨蛋附近有不少好玩的地方！點下方連結看看 🎪","links":["https://www.travel.taipei/zh-tw/attraction/nearby-attractions/271?page=1"]}
-新店碧潭/碧潭捷運 → {"text":"點下方連結可以看碧潭風景區的捷運出口資訊！🚇","links":["https://foundi.tw/%E7%A2%A7%E6%BD%AD%E9%A2%A8%E6%99%AF%E5%8D%80-%E5%B9%BE%E8%99%9F%E5%87%BA%E5%8F%A3%EF%BC%9F/"]}
-東區逛街/東區捷運 → {"text":"想去東區逛街，點下方連結有更多資訊！👗","links":["https://www.housefeel.com.tw/article"]}
-有什麼電影推薦 → {"text":"以下有電影推薦文章，點進去看看吧！🎬","links":["https://vocus.cc/article/668677b2fd897800018b7dea","https://awds5438qq.pixnet.net/blog/posts/14122488247"]}
-有什麼動漫推薦 → {"text":"點下方連結看看動漫推薦！🎌","links":["https://shonm32.com/anime-osusume000/"]}
-有什麼推薦的劇/電視劇推薦 → {"text":"以下有最新劇集推薦！📺","links":["https://www.elle.com/tw/entertainment/drama/g63502713/best-chinese-drama-list-2025/","https://www.elle.com/tw/entertainment/drama/g63055787/2025-chinese-drama/"]}
-休息房間/開休息的地方 → {"text":"以下有台北休息房資訊！","links":["https://tiya.tw/%E5%8F%B0%E5%8C%97%E4%BC%91%E6%81%AF3%E5%B0%8F%E6%99%82/","https://www.google.com/maps?authuser=0"]}
-可以看電影的地方/電影院在哪 → {"text":"以下有台北電影院資訊！🍿","links":["https://www.tripadvisor.com.tw/Attractions-g293913-Activities-c56-t97-Taipei.html","https://www.google.com/maps?authuser=0"]}
+台北推薦甚麼景點/台北有什麼好玩的 → 由 MD 資料庫提供
+台北車站附近有什麼好玩的景點 → 由 MD 資料庫提供
+台北小巨蛋附近有什麼好玩的 → 由 MD 資料庫提供
+新店碧潭可以搭捷運到哪一站下車 → 由 MD 資料庫提供
+有什麼電影推薦 → 由 MD 資料庫提供
+有什麼動漫推薦 → 由 MD 資料庫提供
+有什麼推薦的劇 → 由 MD 資料庫提供
+附近可以開休息房間的地方 → 由 MD 資料庫提供
 
 --- 醫療類 ---
 我不想吃藥 → {"text":"有時候藥可以讓你身體或心情好起來，不吃藥可能會讓病情變慢康復喔。如果真的不想吃，可以告訴醫生、Karen、Doris、Amy，一起討論解決方法！","links":[]}
@@ -113,9 +166,9 @@ text 和 links 至少一個有內容，links 只在確實有網址時填寫。
 醫生說的話我不懂要怎麼問 → {"text":"可以直接說「我不懂，可以再解釋一次嗎？」醫生會願意再解釋的，不用不好意思！","links":[]}
 如果生病了要休息多久 → {"text":"看病的嚴重程度而定，一般多休息、不要太累，聽醫生的建議最安全。","links":[]}
 我一直想睡覺怎麼辦 → {"text":"可以多休息沒關係，但如果一直沒有好轉，應該要去看醫生，或是問問 Karen、Doris、Amy 怎麼辦喔！","links":[]}
-夢是真的嗎 → {"text":"關於夢的知識，點下方連結看看！😴","links":["https://goodholiday.com.tw/article/EA7119007E1558C8340B"]}
+夢是真的嗎 → 由 MD 資料庫提供
 為什麼睡覺會打呼 → {"text":"關於打呼的原因，點下方連結看看！","links":["https://ck.ccgh.com.tw/doctor_listDetail169.htm"]}
-為什麼不能吃糖 → {"text":"關於糖對身體的影響，點下方連結看看！🍬","links":["https://www.skmh.com.tw/education_detail.php?Key=31"]}
+為什麼不能吃糖 → 由 MD 資料庫提供
 
 --- 人際互動建議類 ---
 跟別人吵架怎麼辦 → {"text":"1. 先冷靜下來，不要馬上回嘴或生氣。\n2. 可以離開一下現場，給自己和對方一些空間。\n3. 想清楚自己想表達的事情，等雙方冷靜再說。\n4. 說話時用「我覺得⋯」或「我希望⋯」開頭，不要責怪對方。\n5. 如果情緒還是很難控制，可以和 Karen、Doris、Amy 說！","links":[]}
@@ -130,8 +183,10 @@ text 和 links 至少一個有內容，links 只在確實有網址時填寫。
 別人表現出生氣我該怎麼反應 → {"text":"先冷靜，不生氣，不要反駁，聽對方說。給對方一些空間表達！","links":[]}
 別人對我態度冷淡我該怎麼辦 → {"text":"不要生氣，可以先保持禮貌，給對方一些空間，或找其他朋友互動。也可以找 Karen、Doris、Amy 聊聊！","links":[]}
 如果跟朋友意見不同要怎麼表達自己的想法 → {"text":"可以用「我覺得⋯」或「我想⋯」開頭，不要責怪對方，保持尊重和禮貌！","links":[]}
-各個星座月份/星座日期 → {"text":"星座日期如下：\n♈ 牡羊座 3/21-4/19\n♉ 金牛座 4/20-5/20\n♊ 雙子座 5/21-6/20\n♋ 巨蟹座 6/21-7/22\n♌ 獅子座 7/23-8/22\n♍ 處女座 8/23-9/22\n♎ 天秤座 9/23-10/22\n♏ 天蠍座 10/23-11/21\n♐ 射手座 11/22-12/21\n♑ 魔羯座 12/22-1/19\n♒ 水瓶座 1/20-2/18\n♓ 雙魚座 2/19-3/20","links":[]}
-血型有什麼有趣的地方/血型個性 → {"text":"點下方連結看看血型的有趣知識！🩸","links":["https://vocus.cc/article/668677b2fd897800018b7dea"]}
+若使用者詢問某個日期是什麼星座（例如「8/18是什麼星座」「我的生日是1月5日是什麼星座」「3/21是哪個星座」），
+請根據日期判斷對應星座，只回傳該星座名稱與符號，格式：
+{"text":"8/18 是獅子座 ♌","links":[]}
+血型有什麼有趣的地方/血型個性 → 由 MD 資料庫提供
 
 --- 理財類 ---
 悠遊卡要怎麼儲值 → {"text":"可以到超商（7-11、全家）、捷運站的儲值機儲值，把錢加到卡裡就可以用了！🎫","links":[]}
@@ -143,7 +198,7 @@ text 和 links 至少一個有內容，links 只在確實有網址時填寫。
 我可以給別人借錢嗎要注意什麼 → {"text":"可以借，但要先想清楚對方會還嗎，借多少、什麼時候還都要講清楚，最好有記錄，這樣比較安全！","links":[]}
 
 ==========================================================
-【第四優先：自由回答（題庫以外的日常問題）】
+【第六優先：自由回答（題庫以外的日常問題）】
 ==========================================================
 若問題不在題庫範圍內，也未觸發安全護欄，則用你自己的知識用繁體中文親切地回答。
 規則：
@@ -233,6 +288,262 @@ def enrich_links(text: str, links: list) -> list:
 
 
 # ══════════════════════════════════════════════════════
+#  ★ CWA 天氣 API 相關函式
+# ══════════════════════════════════════════════════════
+
+# 天氣問題關鍵字清單
+WEATHER_KEYWORDS = [
+    "天氣", "溫度", "下雨", "太陽", "颱風", "出門", "雨傘",
+    "天氣變化", "洗衣服", "風大", "風會不會", "潮濕", "起霧",
+    "帶傘", "會不會雨", "要帶傘",
+]
+
+# 城市名稱對照（使用者輸入 → CWA API locationName）
+CITY_MAP = {
+    "台北": "臺北市", "臺北": "臺北市",
+    "新北": "新北市",
+    "桃園": "桃園市",
+    "台中": "臺中市", "臺中": "臺中市",
+    "台南": "臺南市", "臺南": "臺南市",
+    "高雄": "高雄市",
+    "基隆": "基隆市",
+    "新竹": "新竹縣",
+    "苗栗": "苗栗縣",
+    "彰化": "彰化縣",
+    "南投": "南投縣",
+    "雲林": "雲林縣",
+    "嘉義": "嘉義縣",
+    "屏東": "屏東縣",
+    "宜蘭": "宜蘭縣",
+    "花蓮": "花蓮縣",
+    "台東": "臺東縣", "臺東": "臺東縣",
+    "澎湖": "澎湖縣",
+    "金門": "金門縣",
+    "馬祖": "連江縣",
+}
+
+
+def is_weather_query(text: str) -> bool:
+    """判斷是否為天氣相關問題。"""
+    return any(kw in text for kw in WEATHER_KEYWORDS)
+
+
+def extract_city_from_query(text: str) -> str:
+    """從問題中擷取城市名；找不到則回傳預設城市。"""
+    for keyword, full_name in CITY_MAP.items():
+        if keyword in text:
+            return full_name
+    return CWA_DEFAULT_CITY
+
+
+@st.cache_data(ttl=1800)   # 快取 30 分鐘，避免重複打 API
+def fetch_cwa_weather(city: str) -> dict | None:
+    """
+    呼叫 CWA F-C0032-001（縣市 36 小時天氣預報）。
+    回傳整理後的天氣摘要字典；失敗則回傳 None。
+
+    使用 API：臺灣各縣市天氣預報資料（F-C0032-001）
+    申請網址：https://opendata.cwa.gov.tw
+    """
+    if not CWA_API_KEY:
+        return None
+    try:
+        url = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/F-C0032-001"
+        params = {
+            "Authorization": CWA_API_KEY,
+            "locationName":  city,
+            "elementName":   "Wx,PoP,MinT,MaxT,CI",
+        }
+        res = requests.get(url, params=params, timeout=8)
+        res.raise_for_status()
+        data = res.json()
+
+        locations = data.get("records", {}).get("location", [])
+        if not locations:
+            return None
+
+        loc      = locations[0]
+        elements = {
+            e["elementName"]: e["time"][0]
+            for e in loc["weatherElement"]
+            if e.get("time")
+        }
+
+        return {
+            "city":      loc["locationName"],
+            "start":     elements.get("Wx", {}).get("startTime", ""),
+            "end":       elements.get("Wx", {}).get("endTime", ""),
+            "weather":   elements.get("Wx", {}).get("parameter", {}).get("parameterName", ""),
+            "rain_pct":  elements.get("PoP", {}).get("parameter", {}).get("parameterValue", ""),
+            "min_temp":  elements.get("MinT", {}).get("parameter", {}).get("parameterValue", ""),
+            "max_temp":  elements.get("MaxT", {}).get("parameter", {}).get("parameterValue", ""),
+            "comfort":   elements.get("CI", {}).get("parameter", {}).get("parameterName", ""),
+        }
+    except Exception:
+        return None
+
+
+def build_weather_system_block(weather: dict) -> str:
+    """將天氣字典轉為注入 system prompt 的文字區塊。"""
+    return (
+        f"\n\n【今日天氣資料 — {weather['city']}】\n"
+        f"預報時段：{weather['start']} ～ {weather['end']}\n"
+        f"天氣現象：{weather['weather']}\n"
+        f"降雨機率：{weather['rain_pct']}%\n"
+        f"氣溫範圍：{weather['min_temp']}°C ～ {weather['max_temp']}°C\n"
+        f"舒適度：{weather['comfort']}"
+    )
+
+
+# ══════════════════════════════════════════════════════
+#  MD 資料庫相關函式
+# ══════════════════════════════════════════════════════
+
+@st.cache_data
+def load_md_qa_database() -> list[dict]:
+    if not os.path.exists(EXCEL_PATH):
+        return []
+    try:
+        df = pd.read_excel(EXCEL_PATH)
+    except Exception:
+        return []
+
+    entries = []
+    for _, row in df.iterrows():
+        answers = []
+        for col in ["答案-1", "答案-2", "答案-3"]:
+            val = row.get(col, "")
+            if pd.notna(val) and str(val).strip():
+                answers.append(str(val).strip())
+
+        md_files  = [a for a in answers if a.endswith(".md")]
+        other_ans = [a for a in answers if not a.endswith(".md")]
+
+        if md_files:
+            entries.append({
+                "question": str(row["題目"]).strip(),
+                "category": str(row["類別"]).strip(),
+                "md_files": md_files,
+                "other":    other_ans,
+            })
+    return entries
+
+
+def extract_md_body(raw: str) -> str:
+    marker = "Markdown Content:"
+    idx    = raw.find(marker)
+    body   = raw[idx + len(marker):].strip() if idx != -1 else raw.strip()
+    if len(body) > MD_CONTENT_MAX_CHARS:
+        body = body[:MD_CONTENT_MAX_CHARS] + "\n…（內容過長，已截斷）"
+    return body
+
+
+def extract_url_source(raw: str) -> str:
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("URL Source:"):
+            return stripped.replace("URL Source:", "").strip()
+    return ""
+
+
+def load_md_file(filename: str) -> tuple[str, str]:
+    path = os.path.join(MD_DATABASE_PATH, filename)
+    if not os.path.exists(path):
+        return "", ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        return extract_md_body(raw), extract_url_source(raw)
+    except Exception:
+        return "", ""
+
+
+# ══════════════════════════════════════════════════════
+#  星座判斷
+# ══════════════════════════════════════════════════════
+_ZODIAC_TABLE = [
+    (1,  19, "魔羯座", "♑"),
+    (2,  18, "水瓶座", "♒"),
+    (3,  20, "雙魚座", "♓"),
+    (4,  19, "牡羊座", "♈"),
+    (5,  20, "金牛座", "♉"),
+    (6,  20, "雙子座", "♊"),
+    (7,  22, "巨蟹座", "♋"),
+    (8,  22, "獅子座", "♌"),
+    (9,  22, "處女座", "♍"),
+    (10, 22, "天秤座", "♎"),
+    (11, 21, "天蠍座", "♏"),
+    (12, 21, "射手座", "♐"),
+    (12, 31, "魔羯座", "♑"),
+]
+
+def get_zodiac(month: int, day: int) -> tuple[str, str] | None:
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    for end_m, end_d, name, symbol in _ZODIAC_TABLE:
+        if month < end_m or (month == end_m and day <= end_d):
+            return name, symbol
+    return None
+
+
+def detect_zodiac_query(user_text: str) -> dict | None:
+    patterns = [
+        r'(\d{1,2})[/月](\d{1,2})[日號]?',
+        r'(\d{1,2})-(\d{1,2})',
+    ]
+    keywords = ["星座", "什麼座", "哪個座", "是幾座"]
+    if not any(kw in user_text for kw in keywords):
+        return None
+    for pat in patterns:
+        m = re.search(pat, user_text)
+        if m:
+            month, day = int(m.group(1)), int(m.group(2))
+            result = get_zodiac(month, day)
+            if result:
+                name, symbol = result
+                return {"text": f"{month}/{day} 是{name} {symbol}", "links": []}
+    return None
+
+
+# ══════════════════════════════════════════════════════
+#  MD 題目比對
+# ══════════════════════════════════════════════════════
+def find_md_match(user_text: str, md_entries: list[dict]) -> dict | None:
+    def normalize(s: str) -> str:
+        return re.sub(r"[？?。，、！!　 ]", "", s)
+
+    user_norm = normalize(user_text)
+    best_entry, best_score = None, 0.0
+
+    for entry in md_entries:
+        q_norm = normalize(entry["question"])
+        if not q_norm:
+            continue
+        common = sum(1 for c in q_norm if c in user_norm)
+        score  = common / len(q_norm)
+        if score > best_score and score >= 0.6:
+            best_score = score
+            best_entry = entry
+
+    return best_entry
+
+
+def build_md_context(entry: dict) -> tuple[str, list[str]]:
+    parts, urls = [], []
+    for md_file in entry["md_files"]:
+        body, url = load_md_file(md_file)
+        if body:
+            label = md_file.replace(".md", "")
+            parts.append(f"【{label}】\n{body}")
+        if url:
+            urls.append(url)
+    for ans in entry.get("other", []):
+        if ans.startswith("http") and ans not in urls:
+            urls.append(ans)
+    return "\n\n".join(parts), urls
+
+
+# ══════════════════════════════════════════════════════
 #  GPT 呼叫
 # ══════════════════════════════════════════════════════
 def parse_response(raw: str) -> dict:
@@ -243,7 +554,7 @@ def parse_response(raw: str) -> dict:
     try:
         start = raw.index("{")
         depth = 0
-        end = start
+        end   = start
         for i, ch in enumerate(raw[start:], start):
             if ch == "{":
                 depth += 1
@@ -253,8 +564,8 @@ def parse_response(raw: str) -> dict:
                     end = i + 1
                     break
         parsed = json.loads(raw[start:end])
-        text = str(parsed.get("text", ""))
-        links = parsed.get("links", [])
+        text   = str(parsed.get("text", ""))
+        links  = parsed.get("links", [])
         return {"text": text, "links": links if isinstance(links, list) else []}
     except (ValueError, json.JSONDecodeError):
         pass
@@ -265,21 +576,67 @@ def parse_response(raw: str) -> dict:
 
 
 def call_gpt(history: list, user_text: str) -> dict:
+    print(f"[call_gpt] 收到問題：{user_text[:30]}")
     clean_key = "".join(c for c in OPENAI_API_KEY if ord(c) < 128).strip()
-    client = OpenAI(api_key=clean_key)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    client    = OpenAI(api_key=clean_key)
+
+    # ── 1. 星座日期快速判斷（不需呼叫 GPT）────────────────
+    zodiac_result = detect_zodiac_query(user_text)
+    if zodiac_result:
+        return zodiac_result
+
+    # ── 2. ★ 天氣問題：呼叫 CWA API，注入即時資料 ──────────
+    extra_system = ""
+    weather_fallback_links = ["https://www.cwa.gov.tw/V8/C/W/County/index.html"]
+
+    if is_weather_query(user_text):
+        city    = extract_city_from_query(user_text)
+        weather = fetch_cwa_weather(city)
+        if weather:
+            # 有資料 → 注入 system prompt，讓 GPT 直接回答
+            extra_system = build_weather_system_block(weather)
+        # 無資料（API 未設定或失敗）→ extra_system 為空，GPT 會依 prompt 給連結
+
+    # ── 3. MD 資料庫比對 ───────────────────────────────────
+    md_entries = load_md_qa_database()
+    matched    = find_md_match(user_text, md_entries)
+    hint_urls  = []
+
+    if matched:
+        context_text, hint_urls = build_md_context(matched)
+        augmented = (
+            f"{user_text}\n\n"
+            "[MD資料庫內容 — 請根據以下內容整理並回答上方問題]\n"
+            f"{context_text}"
+        ) if context_text else user_text
+    else:
+        augmented = user_text
+
+    # ── 4. 組合 messages（天氣資料附在 system prompt 末尾）──
+    system_content = SYSTEM_PROMPT + extra_system
+    messages = [{"role": "system", "content": system_content}]
     for msg in history:
         role = "user" if msg["role"] == "user" else "assistant"
         messages.append({"role": role, "content": msg["content"]})
-    messages.append({"role": "user", "content": user_text})
+    messages.append({"role": "user", "content": augmented})
+
     response = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
         temperature=0.2,
         max_tokens=1000,
     )
-    raw = response.choices[0].message.content.strip()
+    raw    = response.choices[0].message.content.strip()
     result = parse_response(raw)
+
+    # ── 5. 天氣問題一定附上 CWA 連結 ──────────────────────
+    if is_weather_query(user_text) and not result["links"]:
+        result["links"] = weather_fallback_links
+
+    # MD hint_urls 補充
+    if not result["links"] and hint_urls:
+        result["links"] = hint_urls
+
     result["links"] = enrich_links(result["text"], result["links"])
     return result
 
@@ -323,7 +680,6 @@ def main():
 
     init_state()
 
-    # ── Query Param 重置 ──
     if st.query_params.get("reset") == "1":
         st.query_params.clear()
         reset_chat()
@@ -331,19 +687,12 @@ def main():
 
     check_auto_reset()
 
-    # 每 30 秒 rerun 一次
     st_autorefresh(interval=30000, limit=None, key="reset_check")
 
-    # 計算剩餘時間
     elapsed   = int(time.time() - st.session_state.last_activity)
     remaining = max(0, RESET_SECONDS - elapsed)
     mins, secs = divmod(remaining, 60)
 
-    # ══════════════════════════════════════════════════
-    # ★ 重置按鈕：使用原生 st.button（Python 層處理，100% 可靠）
-    #   必須在 header markdown 之前 render，才能是頁面第一個 stButton。
-    #   Timer JS 會用 window.parent 把它的容器移到 header 右側。
-    # ══════════════════════════════════════════════════
     if st.button("🔄 重置", key="hdr_reset"):
         reset_chat()
         st.rerun()
@@ -358,7 +707,6 @@ def main():
         max-width: 760px;
     }}
 
-    /* ── 固定 Header ── */
     #fixed-header {{
         position: fixed;
         top: 2.875rem;
@@ -414,11 +762,10 @@ def main():
         color: #a7f3d0;
     }}
 
-    /* ── 重置按鈕容器（由 JS 加上此 ID 後生效）── */
     #hdr-reset-container {{
         position: fixed;
-        top: calc(2.875rem + 11px);   /* JS 會覆蓋為精確值 */
-        right: 140px;                  /* JS 會覆蓋為精確值 */
+        top: calc(2.875rem + 11px);
+        right: 140px;
         z-index: 10001;
         margin: 0 !important;
     }}
@@ -440,7 +787,6 @@ def main():
         border-color: rgba(255,255,255,.75) !important;
     }}
 
-    /* 連結按鈕 */
     .stLinkButton a {{
         background: #f0fdf4 !important; color: #166534 !important;
         border: 1.5px solid #86efac !important;
@@ -468,7 +814,6 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Timer JS ＋ 把原生 st.button 搬到 header 右側 ──
     st.components.v1.html(f"""
     <script>
     var s = {remaining};
@@ -485,14 +830,11 @@ def main():
     }})();
     setInterval(tick,1000);
 
-    // 把第一個 stButton（原生 st.button 重置按鈕）移到 header 右側
-    // 動態讀取 timer-box 的實際 DOM 位置，讓按鈕與計時器對齊
     function moveResetBtn() {{
         try {{
             var doc = window.parent.document;
             var btn = doc.querySelector('[data-testid="stButton"]');
             var timerBox = doc.querySelector('.timer-box');
-
             if (btn && timerBox) {{
                 var rect = timerBox.getBoundingClientRect();
                 var container = btn.closest('[data-testid="element-container"]')
@@ -501,9 +843,7 @@ def main():
                     container.id = 'hdr-reset-container';
                 }}
                 if (container) {{
-                    // 垂直：與 timer-box 頂端對齊
                     container.style.top  = rect.top + 'px';
-                    // 水平：緊靠 timer-box 左側，間距 10px
                     var btnW = container.offsetWidth || 90;
                     container.style.right = (window.parent.innerWidth - rect.left + 10) + 'px';
                     container.style.left  = 'auto';
@@ -513,20 +853,17 @@ def main():
             }}
         }} catch(e) {{}}
     }}
-    // 頁面載入後執行，同時每 500ms 修正一次（應對 Streamlit rerun）
     moveResetBtn();
     setInterval(moveResetBtn, 500);
     </script>
     """, height=1)
 
-    # Reset notice
     if st.session_state.reset_notice:
         st.success("✨ 對話已自動重置，歡迎再次提問！")
         st.session_state.reset_notice = False
 
     st.divider()
 
-    # 歡迎訊息
     if not st.session_state.messages:
         with st.chat_message("assistant", avatar="🌿"):
             st.write(
@@ -537,7 +874,7 @@ def main():
         st.markdown("**💬 快速提問：**")
         quick_qs = [
             "今天天氣怎麼樣？", "台北推薦什麼景點？",
-            "有什麼電影推薦？",  "悠遊卡要怎麼儲值？",
+            "今天需要帶雨傘嗎？",  "悠遊卡要怎麼儲值？",
         ]
         cols = st.columns(2)
         for i, q in enumerate(quick_qs):
@@ -547,7 +884,6 @@ def main():
                 st.session_state["_pending"] = q
                 st.rerun()
 
-    # 顯示歷史訊息
     for msg in st.session_state.messages:
         avatar = "🌿" if msg["role"] == "assistant" else "🙂"
         with st.chat_message(msg["role"], avatar=avatar):
@@ -566,7 +902,6 @@ def main():
                     unsafe_allow_html=True,
                 )
 
-    # 呼叫 GPT
     if st.session_state.get("_pending"):
         user_text = st.session_state.pop("_pending")
         history_before = st.session_state.messages[:-1]
@@ -591,38 +926,33 @@ def main():
                     unsafe_allow_html=True,
                 )
         st.session_state.messages.append({
-            "role": "assistant",
+            "role":    "assistant",
             "content": result["text"],
-            "links": result.get("links", []),
+            "links":   result.get("links", []),
         })
         st.rerun()
 
-    # ── 輸入列：文字輸入框 ──
     user_input = st.chat_input("輸入問題，或點擊上方 🎤 錄音後說話")
 
-    # ── 語音輸入 ──
     audio_file = st.audio_input(
         "錄音",
         key=f"mic_{st.session_state.mic_key}",
         label_visibility="collapsed",
     )
 
-    # 處理文字輸入
     if user_input:
         st.session_state.last_activity = time.time()
         st.session_state.messages.append({"role": "user", "content": user_input.strip(), "links": []})
         st.session_state["_pending"] = user_input.strip()
         st.rerun()
 
-    # 處理語音輸入
     if audio_file is not None:
         audio_bytes = audio_file.read()
         with st.spinner("🎤 語音辨識中…"):
             try:
-                clean_key = "".join(c for c in OPENAI_API_KEY if ord(c) < 128).strip()
-                client_stt = OpenAI(api_key=clean_key)
-
-                mime = getattr(audio_file, "type", "") or ""
+                clean_key   = "".join(c for c in OPENAI_API_KEY if ord(c) < 128).strip()
+                client_stt  = OpenAI(api_key=clean_key)
+                mime        = getattr(audio_file, "type", "") or ""
                 if "webm" in mime:
                     fname, fmime = "audio.webm", "audio/webm"
                 elif "ogg" in mime:
@@ -640,7 +970,7 @@ def main():
                 if voice_text:
                     st.session_state.messages.append({"role": "user", "content": voice_text, "links": []})
                     st.session_state.last_activity = time.time()
-                    st.session_state["_pending"] = voice_text
+                    st.session_state["_pending"]   = voice_text
             except Exception as e:
                 st.warning(f"語音辨識失敗：{e}")
             finally:
