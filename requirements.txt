@@ -1,3 +1,8 @@
 streamlit
 openai
 streamlit-autorefresh
+pandas
+openpyxl
+requests
+gspread
+google-auth
