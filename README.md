@@ -1,4 +1,10 @@
-# 演慈聊天機器人（Yeantsy Chatbot）
+# 演慈康復之家聊天機器人
+### GPT-4o-mini-Based Daily Life Assistant Chatbot for Yeantsy Service Users
+
+![Python](https://img.shields.io/badge/Python-3.10+-blue)
+![Streamlit](https://img.shields.io/badge/Streamlit-Frontend-red)
+![LINE Bot](https://img.shields.io/badge/Platform-Streamlit%20Web-brightgreen)
+![OpenAI](https://img.shields.io/badge/LLM-GPT--4o--mini-purple)
 
 > 基於 GPT-4o-mini 的日常生活輔助聊天機器人，專為演慈服務使用者設計，提供天氣、交通、飲食、娛樂、醫療等生活問答服務。
 
